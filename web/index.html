@@ -1,4 +1,108 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui,sans-serif;max-width:1040px;margin:28px auto;padding:0 16px;color:#222}
+select,input,button,textarea{font:inherit;padding:7px 10px;margin:3px;box-sizing:border-box}
+button{cursor:pointer;border:1px solid #88a;border-radius:6px;background:#eef2ff}
+button.warn{background:#fff3e0;border-color:#d9a441}button.good{background:#e8f5e9;border-color:#5ca05c}
+button.danger{background:#fdecea;border-color:#c0605a}
+.panel{border:1px solid #bbb;padding:14px 16px;border-radius:8px;margin-bottom:14px;background:#fff}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;border-radius:6px;font-size:13px}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:#fff}
+.st-pending_review{background:#e08a1e}.st-confirmed{background:#3d8b40}.st-rejected{background:#b0413e}
+.muted{color:#777;font-size:12px}.row{display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+h2{font-size:17px;margin:0 0 8px}
+</style></head>
+<body>
+<h1>临床试验随机分配与盲法 / 中期锁库</h1>
+<div class="panel row">
+  <label>用户
+    <select id="user"><option value="site1">site1 中心一</option><option value="site2">site2 中心二</option>
+      <option value="coord" selected>coord 协调员</option><option value="monitor1">monitor1 监查员甲</option>
+      <option value="monitor2">monitor2 监查员乙</option></select>
+  </label>
+  <label>试验 ID <input id="trial" value="1" size="4"></label>
+  <button onclick="loadSummary()">查看试验摘要</button>
+  <span id="pauseTip"></span>
+</div>
+
+<div class="panel">
+  <h2>中期锁库批次</h2>
+  <div class="row">
+    <button onclick="loadBatches()">刷新批次状态/历史</button>
+    <button class="warn" onclick="initiateLock()">协调员发起锁库（记录切点并暂停入组）</button>
+  </div>
+  <div id="batches"></div>
+  <p class="muted">锁库复核期内紧急揭盲可照常受理；复核通过后固化切点人数、中心分布与审计记录并恢复入组；
+  复核不通过则不生成批次快照并恢复入组，晚到的揭盲不会写入旧批次。</p>
+</div>
+
+<div class="panel"><h2>试验摘要（含审计）</h2><pre id="out">点击“查看试验摘要”加载。</pre></div>
+
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,method="GET",body){
+  const opt={method,headers:{"X-User-Id":$("user").value}};
+  if(body){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body)}
+  const r=await fetch(path,opt);return {status:r.status,data:await r.json()};
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+
+async function loadSummary(){
+  const {data}=await api(`/api/trials/${$("trial").value}/summary`);
+  $("out").textContent=JSON.stringify(data,null,2);
+  if(data.error){$("pauseTip").textContent="";return}
+  $("pauseTip").innerHTML=data.enrollment_paused
+    ?'<span class="badge st-pending_review">入组已暂停：锁库待复核</span>'
+    :'<span class="muted">入组进行中</span>';
+}
+
+async function initiateLock(){
+  const note=prompt("可选：填写本次中期锁库说明","")||"";
+  const {status,data}=await api(`/api/trials/${$("trial").value}/lock-batches`,"POST",{note});
+  alert(status===201?`批次 #${data.batch_no} 已发起，切点 ${data.cutoff_at}`:data.error.message);
+  loadBatches();loadSummary();
+}
+
+async function reviewBatch(id,decision){
+  const note=prompt(decision==="confirm"?"可选：复核通过说明":"可选：复核不通过原因","")||"";
+  const {status,data}=await api(`/api/lock-batches/${id}/review`,"POST",{decision,note});
+  alert(status===200?`批次 #${data.batch_no} 已${decision==="confirm"?"通过并固化快照":"驳回，入组已恢复"}`:data.error.message);
+  loadBatches();loadSummary();
+}
+
+function batchTable(items){
+  if(!items.length)return '<p class="muted">该试验暂无锁库批次。</p>';
+  let h='<table><tr><th>批次</th><th>状态</th><th>切点(UTC)</th><th>发起人/时间</th><th>复核人/时间</th><th>操作/快照</th></tr>';
+  for(const b of items){
+    let action="";
+    if(b.status==="pending_review"){
+      action=`<button class="good" onclick="reviewBatch(${b.id},'confirm')">复核通过(生成快照)</button>
+              <button class="danger" onclick="reviewBatch(${b.id},'reject')">复核不通过</button>`;
+    }else if(b.snapshot){
+      const s=b.snapshot;
+      action=`<div>切点人数：<b>${s.participant_count}</b>；
+        中心分布：${esc(s.site_distribution.map(x=>`${x.site_id}=${x.count}`).join("， ")||"无")}</div>
+        <details><summary class="muted">查看快照审计与受试者明细（${s.audit_records.length} 条审计）</summary>
+        <pre>${esc(JSON.stringify(s,null,2))}</pre></details>`;
+    }else{
+      action='<span class="muted">未生成快照</span>';
+    }
+    h+=`<tr><td>#${b.batch_no}</td>
+      <td><span class="badge st-${b.status}">${esc(b.status_label)}</span>${b.review_note?`<div class="muted">${esc(b.review_note)}</div>`:""}</td>
+      <td>${esc(b.cutoff_at)}<div class="muted">受试者水位 #${b.cutoff_participant_id} / 审计水位 #${b.cutoff_audit_id}</div></td>
+      <td>${esc(b.initiated_by)}<div class="muted">${esc(b.initiated_at)}</div></td>
+      <td>${esc(b.reviewed_by||"—")}<div class="muted">${esc(b.reviewed_at||"")}</div></td>
+      <td>${action}</td></tr>`;
+  }
+  return h+"</table>";
+}
+
+async function loadBatches(){
+  const {data}=await api(`/api/trials/${$("trial").value}/lock-batches`);
+  $("batches").innerHTML=data.error?`<p class="muted">${esc(data.error.message)}</p>`:batchTable(data.items);
+}
+
+loadSummary();loadBatches();
+</script></body></html>
