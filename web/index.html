@@ -1,4 +1,137 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>临床试验随机化与中期锁库</title>
+<style>
+body{font:15px system-ui,sans-serif;max-width:1040px;margin:28px auto;padding:0 16px;color:#222}
+.panel{border:1px solid #bbb;border-radius:8px;padding:14px 16px;margin-bottom:16px}
+select,input,button,textarea{padding:7px 9px;margin:3px;font:inherit;box-sizing:border-box}
+button{cursor:pointer;border-radius:5px;border:1px solid #888;background:#fff}
+button.primary{background:#2456a8;color:#fff;border-color:#2456a8}
+button.warn{background:#a83b2f;color:#fff;border-color:#a83b2f}
+pre{background:#f5f5f5;padding:12px;border-radius:6px;white-space:pre-wrap;font-size:13px;max-height:340px;overflow:auto}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:13px;vertical-align:top}
+th{background:#eef2f8}
+.tag{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;color:#fff}
+.tag-pending{background:#c2830a}.tag-completed{background:#2e7d32}.tag-rejected{background:#8a8a8a}
+.muted{color:#666;font-size:12px}
+.snapshot{background:#eef5ee;border:1px solid #b8d6bb;border-radius:6px;padding:10px;margin-top:8px;display:none}
+h2{font-size:17px;margin:18px 0 8px}
+</style>
+</head>
+<body>
+<h1>临床试验随机分配与中期锁库</h1>
+
+<div class="panel">
+  用户：
+  <select id="user">
+    <option value="site1">site1（中心一）</option>
+    <option value="site2">site2（中心二）</option>
+    <option value="coord" selected>coord（协调员）</option>
+    <option value="monitor1">monitor1（监查员甲）</option>
+    <option value="monitor2">monitor2（监查员乙）</option>
+  </select>
+  试验 ID：<input id="trial" value="1" size="4">
+  <button class="primary" onclick="loadAll()">查看摘要与锁库批次</button>
+  <span id="pauseFlag" class="muted"></span>
+</div>
+
+<div class="panel">
+  <b>锁库批次（协调员发起 / 监查员复核）</b>
+  <div>
+    <input id="reason" placeholder="发起原因（可选）" size="40">
+    <button class="primary" onclick="initiateLock()">协调员：发起锁库批次</button>
+    <span class="muted">发起后记录数据切点并暂停新入组；已受理的紧急揭盲继续办完。</span>
+  </div>
+  <div id="batches"></div>
+</div>
+
+<h2>试验摘要（实时）</h2>
+<pre id="out"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = () => ({'X-User-Id': $('user').value});
+
+async function api(url, options){
+  const r = await fetch(url, Object.assign({headers: headers()}, options || {}));
+  return {status: r.status, body: await r.json()};
+}
+function esc(s){return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function tag(status){
+  const map = {pending:['待复核','tag-pending'], completed:['已完成（批次已生成）','tag-completed'], rejected:['复核不通过（未生成批次）','tag-rejected']};
+  const [text, cls] = map[status] || [status, 'tag-pending'];
+  return `<span class="tag ${cls}">${text}</span>`;
+}
+
+async function loadAll(){
+  const tid = $('trial').value;
+  const summary = await api(`/api/trials/${tid}/summary`);
+  $('out').textContent = JSON.stringify(summary.body, null, 2);
+  const trial = summary.body.trial || {};
+  $('pauseFlag').textContent = trial.enrollment_paused ? '⚠ 当前已暂停新入组，等待监查员复核' : '';
+  const res = await api(`/api/trials/${tid}/lock-batches`);
+  renderBatches(res.status, res.body);
+}
+
+function renderBatches(status, body){
+  const box = $('batches');
+  if(status === 403){ box.innerHTML = '<p class="muted">当前角色无权查看锁库批次（仅协调员/监查员）。</p>'; return; }
+  if(body.error){ box.innerHTML = `<p class="muted">${esc(body.error.message)}</p>`; return; }
+  const items = body.items || [];
+  if(!items.length){ box.innerHTML = '<p class="muted">暂无锁库批次。</p>'; return; }
+  box.innerHTML = `<table><tr><th>批次号</th><th>状态</th><th>数据切点</th>
+    <th>发起</th><th>复核</th><th>操作 / 结果</th></tr>` +
+    items.map(b => `
+    <tr>
+      <td>#${b.batch_no}<br><span class="muted">ID ${b.id}</span></td>
+      <td>${tag(b.status)}</td>
+      <td>${esc(b.cutoff_at)}<br><span class="muted">受试者 ≤ #${b.participant_cutoff_id}，审计 ≤ #${b.audit_cutoff_id}</span></td>
+      <td>${esc(b.initiated_by)}<br><span class="muted">${esc(b.initiated_at)}</span></td>
+      <td>${esc(b.reviewed_by || '-')}<br><span class="muted">${esc(b.reviewed_at || '')}</span></td>
+      <td>
+        ${b.status === 'pending'
+          ? `<input id="note-${b.id}" placeholder="复核意见（不通过必填）" size="26">
+             <button class="primary" onclick="review(${b.id},true)">复核通过并恢复入组</button>
+             <button class="warn" onclick="review(${b.id},false)">复核不通过并恢复入组</button>`
+          : (b.review_note ? `意见：${esc(b.review_note)}` : '')}
+        ${b.snapshot
+          ? `<button onclick="toggleSnap(${b.id})">查看切点快照</button>
+             <div class="snapshot" id="snap-${b.id}"><pre>${esc(JSON.stringify(b.snapshot,null,2))}</pre></div>`
+          : ''}
+      </td>
+    </tr>`).join('') + '</table>';
+}
+
+function toggleSnap(id){
+  const el = $('snap-' + id);
+  el.style.display = el.style.display === 'block' ? 'none' : 'block';
+}
+
+async function initiateLock(){
+  const tid = $('trial').value;
+  const res = await api(`/api/trials/${tid}/lock-batches/initiate`, {
+    method: 'POST',
+    headers: Object.assign({'Content-Type': 'application/json'}, headers()),
+    body: JSON.stringify({reason: $('reason').value})
+  });
+  alert(res.body.error ? res.body.error.message : `批次 #${res.body.batch_no} 已发起（${res.body.status}）`);
+  loadAll();
+}
+
+async function review(id, approve){
+  const note = $('note-' + id)?.value || '';
+  const res = await api(`/api/lock-batches/${id}/review`, {
+    method: 'POST',
+    headers: Object.assign({'Content-Type': 'application/json'}, headers()),
+    body: JSON.stringify({approve, note})
+  });
+  alert(res.body.error ? res.body.error.message : `批次 #${res.body.batch_no}：${res.body.status}，入组已恢复`);
+  loadAll();
+}
+</script>
+</body>
+</html>
